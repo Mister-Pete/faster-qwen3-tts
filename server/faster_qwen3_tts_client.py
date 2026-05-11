@@ -10,11 +10,19 @@ Usage:
         --text "Hello, how are you?" \
         --output output.wav
 
+    # True HTTP streaming + live playback (no file)
+    python server/faster_qwen3_tts_client.py \
+        --text "Hello, this should stream in real time" \
+        --format pcm \
+        --stream --play
+
     # With custom instruct (emotion, style, etc.)
     python server/faster_qwen3_tts_client.py \
         --text "Hello, how are you?" \
         --instruct "gender: female. pitch: low female pitch. speed: deliberate pace, starting slow. age: 32. clarity: medium clarity. accent: American English. texture: slightly gravelly. tone: sad. personality: depressed. Emotion: Spoke with a very sad and tearful voice. Start sad and end very upset and sobbing" \
-        --output output_sad.wav
+        --format pcm \
+        --stream --play \
+        --output output_sad.pcm
 
     # Custom voice/speaker
     python server/faster_qwen3_tts_client.py \
@@ -31,8 +39,12 @@ Usage:
 
 import argparse
 import sys
+import time
+
+import numpy as np
 import requests
-from typing import Optional
+
+from audio import StreamPlayer
 
 
 def main():
@@ -89,14 +101,33 @@ def main():
         help="Model ID (default: tts-1, ignored by server)",
     )
 
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Consume response as a stream instead of buffering the full body",
+    )
+    parser.add_argument(
+        "--play",
+        action="store_true",
+        help="Play streamed audio in real time (wav/pcm only)",
+    )
+
     # Output
     parser.add_argument(
         "--output",
-        required=True,
+        default=None,
         help="Output audio file path",
     )
 
     args = parser.parse_args()
+
+    if not args.output and not args.play:
+        print("ERROR: set at least one sink: --output and/or --play", file=sys.stderr)
+        sys.exit(2)
+
+    if args.play and args.format == "mp3":
+        print("ERROR: --play supports only --format wav or pcm", file=sys.stderr)
+        sys.exit(2)
 
     # Build request
     url = f"http://{args.host}:{args.port}/v1/audio/speech"
@@ -121,7 +152,8 @@ def main():
         response = requests.post(
             url,
             json=payload,
-            timeout=300,  # 5 minutes for generation + streaming
+            timeout=(30, 300),
+            stream=args.stream,
         )
         response.raise_for_status()
     except requests.exceptions.ConnectionError as e:
@@ -130,10 +162,10 @@ def main():
         print(f"  Original error: {e}", file=sys.stderr)
         sys.exit(1)
     except requests.exceptions.Timeout as e:
-        print(f"ERROR: Request timed out after 5 minutes", file=sys.stderr)
+        print("ERROR: Request timed out", file=sys.stderr)
         print(f"  Original error: {e}", file=sys.stderr)
         sys.exit(1)
-    except requests.exceptions.HTTPError as e:
+    except requests.exceptions.HTTPError:
         print(f"ERROR: Server returned {response.status_code}", file=sys.stderr)
         try:
             error_detail = response.json().get("detail", response.text)
@@ -145,14 +177,76 @@ def main():
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Write response to file
+    output_file = None
+    player = None
+    total_bytes = 0
+    started_at = time.perf_counter()
+
     try:
-        with open(args.output, "wb") as f:
-            f.write(response.content)
-        print(f"Saved {len(response.content)} bytes to {args.output}")
+        if args.output:
+            output_file = open(args.output, "wb")
+
+        if args.play:
+            player = StreamPlayer()
+
+        if args.stream:
+            # Stream chunk-by-chunk from HTTP response.
+            wav_header_skip = 44 if args.format == "wav" else 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                total_bytes += len(chunk)
+
+                if output_file:
+                    output_file.write(chunk)
+
+                if player:
+                    payload_chunk = chunk
+                    if wav_header_skip > 0:
+                        if len(payload_chunk) <= wav_header_skip:
+                            wav_header_skip -= len(payload_chunk)
+                            continue
+                        payload_chunk = payload_chunk[wav_header_skip:]
+                        wav_header_skip = 0
+
+                    # Convert little-endian PCM16 to float32 in [-1, 1] for StreamPlayer.
+                    pcm16 = np.frombuffer(payload_chunk, dtype=np.int16)
+                    if pcm16.size:
+                        audio = (pcm16.astype(np.float32) / 32768.0)
+                        player(audio, sample_rate=24000)
+        else:
+            data = response.content
+            total_bytes = len(data)
+
+            if output_file:
+                output_file.write(data)
+
+            if player:
+                payload_chunk = data[44:] if args.format == "wav" else data
+                pcm16 = np.frombuffer(payload_chunk, dtype=np.int16)
+                if pcm16.size:
+                    audio = (pcm16.astype(np.float32) / 32768.0)
+                    player(audio, sample_rate=24000)
+
+        elapsed = time.perf_counter() - started_at
+        if args.output:
+            print(f"Saved {total_bytes} bytes to {args.output}")
+        if args.play:
+            print("Playback completed")
+        print(f"Elapsed: {elapsed:.2f}s")
+
     except IOError as e:
         print(f"ERROR: Failed to write to {args.output}: {e}", file=sys.stderr)
         sys.exit(1)
+    except Exception as e:
+        print(f"ERROR during stream processing: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if output_file:
+            output_file.close()
+        if player:
+            player.close()
+        response.close()
 
 
 if __name__ == "__main__":
