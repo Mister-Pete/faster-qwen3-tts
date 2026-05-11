@@ -181,6 +181,8 @@ def main():
     player = None
     total_bytes = 0
     started_at = time.perf_counter()
+    stream_receive_done = None
+    success = False
 
     try:
         if args.output:
@@ -228,12 +230,12 @@ def main():
                     audio = (pcm16.astype(np.float32) / 32768.0)
                     player(audio, sample_rate=24000)
 
-        elapsed = time.perf_counter() - started_at
+        stream_receive_done = time.perf_counter()
+        elapsed_receive = stream_receive_done - started_at
         if args.output:
             print(f"Saved {total_bytes} bytes to {args.output}")
-        if args.play:
-            print("Playback completed")
-        print(f"Elapsed: {elapsed:.2f}s")
+        print(f"Received stream in {elapsed_receive:.2f}s")
+        success = True
 
     except IOError as e:
         print(f"ERROR: Failed to write to {args.output}: {e}", file=sys.stderr)
@@ -247,6 +249,14 @@ def main():
         if player:
             player.close()
         response.close()
+        if success:
+            if args.play:
+                print("Playback completed")
+            total_elapsed = time.perf_counter() - started_at
+            if stream_receive_done is not None:
+                drain_time = total_elapsed - (stream_receive_done - started_at)
+                print(f"Playback drain time: {drain_time:.2f}s")
+            print(f"Total elapsed: {total_elapsed:.2f}s")
 
 
 if __name__ == "__main__":
